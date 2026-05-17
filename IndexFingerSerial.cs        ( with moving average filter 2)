@@ -1,0 +1,309 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// IndexFingerSerial.cs
+// Real-time index finger tracking using a flex sensor and ESP32 over serial.
+//
+// PIPELINE:
+//   ESP32 → Background Thread (ReadLoop) → Update() → ADC mapping
+//   → Sequential bending → Moving Average filter → Velocity assist → Joint rotation
+//
+// CALIBRATION GATE:
+//   trackingAllowed = false at start — finger stays still
+//   FingerCalibration.cs calls AllowTracking(min,max) after calibration
+//   → sets adcMin/adcMax → sets trackingAllowed=true → finger starts moving
+//
+// MOVING AVERAGE TUNING:
+//   maWindow = 8   (lower = faster response, more noise; higher = smoother, more lag)
+//   velGain  = 0.6 (stronger velocity assist to cancel return lag)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+using System.Collections;
+using System.IO.Ports;
+using System.Threading;
+using UnityEngine;
+
+public class IndexFingerSerial : MonoBehaviour
+{
+    // ── FINGER JOINT TRANSFORMS ──────────────────────────────────────────────
+    // index1=MCP (knuckle), index2=PIP (middle), index3=DIP (tip)
+    public Transform index1, index2, index3;
+
+    // ── CALIBRATION — set automatically by FingerCalibration.cs ─────────────
+    [Header("Calibration  ← auto-set by FingerCalibration.cs")]
+    public float adcMin = 2559f;
+    public float adcMax = 2620f;
+    public float angleMin = 0f;
+    public float angleMax = 70f;
+
+    // ── MOVING AVERAGE TUNING ────────────────────────────────────────────────
+    // maWindow: number of samples averaged per joint.
+    //   Lower  = faster response, more noise  (e.g. 4)
+    //   Higher = smoother output,  more lag   (e.g. 16)
+    [Header("Moving Average Filter Tuning")]
+    [Range(2, 32)]
+    public int maWindow = 8;
+
+    // ── MOVING AVERAGE STATE (per joint) ─────────────────────────────────────
+    // Circular buffers — one per joint (MCP, PIP, DIP)
+    float[][] maBuf = { new float[32], new float[32], new float[32] };
+    int[] maHead = { 0, 0, 0 };   // write index inside circular buffer
+    int[] maCount = { 0, 0, 0 };   // how many samples filled so far (ramps up to maWindow)
+
+    // ── VELOCITY ASSIST ──────────────────────────────────────────────────────
+    // velSmooth: how fast velocity estimate adapts (lower=faster)
+    // velGain:   strength of predictive nudge (higher=less lag on fast moves)
+    [Header("Velocity Assist  ← reduces return lag")]
+    public float velSmooth = 0.1f;
+    public float velGain = 0.6f;
+
+    // ── VELOCITY STATE (per joint) ───────────────────────────────────────────
+    float[] prev = { 0, 0, 0 };
+    float[] vel = { 0, 0, 0 };
+
+    // ── SERIAL / THREAD ──────────────────────────────────────────────────────
+    float prevTime;
+    float latestADC = -1f;
+    bool hasNewData = false;
+    Thread readThread;
+    bool running = false;
+
+    // ── CALIBRATION GATE ─────────────────────────────────────────────────────
+    // false = serial runs but finger frozen. True = full tracking active.
+    // Set to true only by AllowTracking() called from FingerCalibration.cs
+    bool trackingAllowed = false;
+
+    // ── DEBUG ────────────────────────────────────────────────────────────────
+    [Header("Debug  ← live read-only values")]
+    public float rawADC = 0f;
+    public float mappedAngle = 0f;
+    public float filteredAngle = 0f;
+
+    // ── PORT ─────────────────────────────────────────────────────────────────
+    [Header("Serial Port")]
+    public string portName = "COM8";
+    public int maxAttempts = 5;
+
+    SerialPort port;
+    Quaternion i1Init, i2Init, i3Init;
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PUBLIC — called by FingerCalibration.cs when calibration is complete.
+    // Writes adcMin/adcMax and unlocks finger tracking.
+    // ════════════════════════════════════════════════════════════════════════
+    public void AllowTracking(float calibratedMin, float calibratedMax)
+    {
+        adcMin = calibratedMin;
+        adcMax = calibratedMax;
+        trackingAllowed = true;
+        Debug.Log("[IndexFingerSerial] Tracking UNLOCKED — adcMin="
+                + adcMin.ToString("F1") + "  adcMax=" + adcMax.ToString("F1"));
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MOVING AVERAGE — circular buffer, per joint.
+    //
+    //   Each call writes z into the ring buffer for joint i, then computes
+    //   the mean of the last maWindow samples.
+    //
+    //   maWindow is clamped to [2,32] to match the fixed buffer size.
+    //   maCount ramps from 0 → maWindow on first fill so the average is
+    //   never polluted by stale zeros during startup.
+    // ════════════════════════════════════════════════════════════════════════
+    float MovingAverage(int i, float z)
+    {
+        int w = Mathf.Clamp(maWindow, 2, 32);   // safe window size
+
+        // Write new sample into circular buffer
+        maBuf[i][maHead[i]] = z;
+        maHead[i] = (maHead[i] + 1) % w;        // advance write pointer
+        if (maCount[i] < w) maCount[i]++;        // ramp up until buffer is full
+
+        // Compute mean over the filled portion
+        float sum = 0f;
+        for (int s = 0; s < maCount[i]; s++)
+            sum += maBuf[i][s];
+        return sum / maCount[i];
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // START — store initial rotations, open serial immediately.
+    // Serial must open before calibration can read rawADC.
+    // ════════════════════════════════════════════════════════════════════════
+    void Start()
+    {
+        rawADC = 0f;
+        mappedAngle = 0f;
+        prevTime = Time.time;
+
+        i1Init = index1.localRotation;
+        i2Init = index2.localRotation;
+        i3Init = index3.localRotation;
+
+        StartCoroutine(OpenPortWithRetry());
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // OPEN PORT WITH RETRY — fixes Access Denied from previous session.
+    // yield cannot be inside catch — bool flag carries result outside.
+    // ════════════════════════════════════════════════════════════════════════
+    IEnumerator OpenPortWithRetry()
+    {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            bool success = false;
+            string errorMsg = "";
+
+            try
+            {
+                port = new SerialPort(portName, 115200);
+                port.ReadTimeout = 100;
+                port.DtrEnable = false;
+                port.RtsEnable = false;
+                port.Handshake = Handshake.None;
+                port.Open();
+                success = true;
+            }
+            catch (System.Exception e)
+            {
+                errorMsg = e.Message;
+                if (port != null)
+                {
+                    try { port.Close(); port.Dispose(); } catch { }
+                    port = null;
+                }
+            }
+
+            if (success)
+            {
+                Debug.Log("[IndexFingerSerial] " + portName
+                        + " opened OK on attempt " + attempt);
+                running = true;
+                readThread = new Thread(ReadLoop);
+                readThread.IsBackground = true;
+                readThread.Start();
+                yield break;
+            }
+            else
+            {
+                Debug.LogWarning("[IndexFingerSerial] attempt " + attempt
+                               + "/" + maxAttempts + " failed: " + errorMsg);
+                if (attempt < maxAttempts)
+                {
+                    Debug.Log("[IndexFingerSerial] Retrying in 1 second...");
+                    yield return new WaitForSeconds(1f);
+                }
+                else
+                {
+                    Debug.LogError("[IndexFingerSerial] Failed after "
+                        + maxAttempts + " attempts. Unplug/replug ESP32.");
+                }
+            }
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // READ LOOP — background thread only.
+    // lock() prevents race condition with Update() on shared variables.
+    // ════════════════════════════════════════════════════════════════════════
+    void ReadLoop()
+    {
+        while (running && port != null && port.IsOpen)
+        {
+            try
+            {
+                string line = port.ReadLine().Trim();
+                if (float.TryParse(line, out float val))
+                    lock (this) { latestADC = val; hasNewData = true; }
+            }
+            catch (System.TimeoutException) { }
+            catch (System.Exception) { break; }
+        }
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // UPDATE — main Unity thread, every frame.
+    // rawADC is ALWAYS updated (calibration reads it).
+    // Angle processing + finger movement only runs after AllowTracking().
+    // ════════════════════════════════════════════════════════════════════════
+    void Update()
+    {
+        // Grab latest ADC from background thread safely
+        float adc = -1f;
+        lock (this)
+        {
+            if (!hasNewData) return;
+            adc = latestADC;
+            hasNewData = false;
+        }
+
+        // Always update rawADC — calibration script needs this
+        rawADC = adc;
+
+        // Finger frozen until calibration calls AllowTracking()
+        if (!trackingAllowed) return;
+
+        float dt = Mathf.Max(Time.time - prevTime, 0.001f);
+        prevTime = Time.time;
+
+        // Step 1 — normalize ADC to 0.0–1.0 using calibrated range
+        float normalized = Mathf.InverseLerp(adcMin, adcMax, adc);
+
+        // Step 2 — scale to 200° total budget (MCP40 + PIP90 + DIP70)
+        mappedAngle = normalized * 200f;
+
+        // Step 3 — sequential bending: each joint activates after previous maxes
+        float mcpAngle = Mathf.Clamp(mappedAngle, 0f, 40f);
+
+        float pipAngle = 0f;
+        if (mappedAngle > 40f)
+            pipAngle = Mathf.Clamp(mappedAngle - 40f, 0f, 90f);
+
+        float dipAngle = 0f;
+        if (mappedAngle > 130f)
+            dipAngle = Mathf.Clamp(mappedAngle - 130f, 0f, 70f);
+
+        float[] raw = { mcpAngle, pipAngle, dipAngle };
+        float[] final = new float[3];
+
+        // Step 4 — Moving Average + velocity assist per joint
+        for (int i = 0; i < 3; i++)
+        {
+            float f = MovingAverage(i, raw[i]);       // smooth angle
+            float rv = (f - prev[i]) / dt;             // raw velocity
+            vel[i] = Mathf.Lerp(vel[i], rv, velSmooth);  // smooth velocity
+            final[i] = f + vel[i] * velGain * dt;     // predictive nudge
+            prev[i] = f;
+        }
+
+        filteredAngle = final[0];   // expose MCP filtered angle for graph
+
+        // Step 5 — apply to finger bones
+        index1.localRotation = i1Init * Quaternion.Euler(0, 0, -final[0]);
+        index2.localRotation = i2Init * Quaternion.Euler(0, 0, -final[1]);
+        index3.localRotation = i3Init * Quaternion.Euler(0, 0, -final[2]);
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CLEANUP — stop thread and close port cleanly.
+    // ════════════════════════════════════════════════════════════════════════
+    void OnDisable()
+    {
+        running = false;
+        if (readThread != null) readThread.Join(200);
+        if (port != null && port.IsOpen)
+        {
+            port.DiscardInBuffer();
+            port.Close();
+            port.Dispose();
+            port = null;
+        }
+    }
+
+    void OnApplicationQuit() => OnDisable();
+}
