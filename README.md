@@ -383,66 +383,6 @@ DIP Bone
 These references are assigned to the corresponding FingerState in the Unity Inspector.
 The hand model therefore acts as the visualization layer of the sensor processing pipeline.
 Complete System Architecture
-                ┌───────────────────┐
-                 │  Sensorized Glove │
-                 │   5 Finger Sensors│
-                 └─────────┬─────────┘
-                           │
-                           ▼
-                 ┌───────────────────┐
-                 │       ESP32       │
-                 │   ADC Acquisition │
-                 └─────────┬─────────┘
-                           │
-                           │ Serial
-                           │ 115200
-                           ▼
-                 ┌───────────────────┐
-                 │ HandFingerSerial  │
-                 │                   │
-                 │   ReadLoop()      │
-                 └─────────┬─────────┘
-                           │
-                           ▼
-                     Raw ADC [5]
-                           │
-                           ▼
-                 ┌───────────────────┐
-                 │     Filtering        │
-                 │ Raw / MA /        │
-                 │ Velocity /           │
-                 │ Velocity Assist  │
-                 └─────────┬─────────┘
-                           │
-                          ▼
-                    Filtered ADC
-                           │
-                          ▼
-                 ┌───────────────────┐
-                 │    Calibration        │
-                 │ FingerCalibration │
-                 └─────────┬─────────┘
-                           │
-                           ▼
-                     Normalized [5]
-                           │
-                           ▼
-                  Finger Flexion [5]
-                           │
-                           ▼
-                 Circular-Grasp Model
-                           │
-                           ▼
-                    MCP / PIP / DIP
-                           │
-                           ▼
-                 ┌───────────────────┐
-                 │   Rigged Hand     │
-                 │      Model             │
-                 └───────────────────┘
-
-
-
 
 
 # Calibration Workflow
@@ -607,10 +547,11 @@ Human-machine interaction
 Soft robotic gloves
 Robotics research
 
-Author
-Shraddha Hirewar
-Robotics & Artificial Intelligence
-MGM University
-Chhatrapati Sambhajinagar, Maharashtra, India
+Author : 
+Shraddha Hirewar 
+Intern Wired Lab,
+Prof. Priyanshu Agrawal,  
+Mechanical Department,
+IIT Bombay, Pawai, Mumbai 
 
 
