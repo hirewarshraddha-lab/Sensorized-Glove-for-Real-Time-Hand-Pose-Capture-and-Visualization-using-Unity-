@@ -4,25 +4,23 @@ Sensorized Glove – Real-Time Hand Pose Capture & Visualization
 
 A Unity-based real-time hand tracking and visualization system developed for a sensorized glove project.
 The system receives sensor values from an ESP32 through serial communication, performs filtering and manual calibration, converts the calibrated values into finger flexion angles, estimates the MCP, PIP, and DIP joint angles using an intrafinger circular-grasp relationship, and finally drives a rigged 3D hand model in Unity.
+
+Main Files
+1. FingerCalibration.cs
+2. Fingerdatastructure.cs
+3. HandFingerSerial.cs
+
 Project Overview
 The software pipeline is:
-ESP32 Sensor Data
-       ↓
-Serial Communication
-       ↓
-Raw ADC Values
-       ↓
-Filtering
-       ↓
-Manual Calibration
-       ↓
-Normalized Value
-       ↓
-Finger Flexion Angle
-       ↓
-MCP / PIP / DIP Estimation
-       ↓
-3D Hand Bone Rotation
+1. ESP32 Sensor Data
+2. Serial Communication
+3. Raw ADC Values
+4. Filtering
+5. Manual Calibration
+6. Normalized Value
+7. Finger Flexion Angle
+8. MCP / PIP / DIP Estimation
+9. 3D Hand Bone Rotation
 
 The current implementation tracks five fingers:
 Thumb
